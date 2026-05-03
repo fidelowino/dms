@@ -1,0 +1,9 @@
+# ─────────────────────────────────────────────
+#  DAWAMU SCHOOL MANAGEMENT SYSTEM — ENV VARS
+# ─────────────────────────────────────────────
+
+PORT=3000
+
+# Gmail credentials for OTP password reset
+GMAIL_USER=fidelowino8@gmail.com
+GMAIL_APP_PASSWORD=ilovekelly@9218
