@@ -402,6 +402,50 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
+  -- ── LIBRARY BOOKS ──
+  CREATE TABLE IF NOT EXISTS library_books (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    code             TEXT UNIQUE NOT NULL,
+    title            TEXT NOT NULL,
+    author           TEXT DEFAULT '',
+    quantity         INTEGER DEFAULT 0,
+    location         TEXT DEFAULT '',
+    unit_cost        REAL DEFAULT 0,
+    supplier         TEXT DEFAULT '',
+    received_date    TEXT DEFAULT '',
+    notes            TEXT DEFAULT '',
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- ── BOOK BORROWING ──
+  CREATE TABLE IF NOT EXISTS book_borrowing (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref              TEXT UNIQUE NOT NULL,
+    book_title       TEXT NOT NULL,
+    book_code        TEXT DEFAULT '',
+    student_admission TEXT NOT NULL,
+    student_class    TEXT NOT NULL,
+    status           TEXT DEFAULT 'borrowed',
+    date_borrowed    TEXT DEFAULT '',
+    date_returned    TEXT DEFAULT '',
+    approver         TEXT DEFAULT '',
+    notes            TEXT DEFAULT '',
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
+  -- ── EXERCISE BOOK EXCHANGES ──
+  CREATE TABLE IF NOT EXISTS exercise_book_exchanges (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ref              TEXT UNIQUE NOT NULL,
+    student_name     TEXT NOT NULL,
+    student_class    TEXT NOT NULL,
+    book_type        TEXT NOT NULL,
+    quantity         INTEGER DEFAULT 1,
+    notes            TEXT DEFAULT '',
+    created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   -- ── SEED USERS ──
   INSERT OR IGNORE INTO users (role,title,password,email) VALUES
     ('admin',        'Administrator',     'admin123', 'fidelowino8@gmail.com'),
@@ -409,7 +453,8 @@ db.exec(`
     ('farm',         'Farm Manager',      'farm123',  ''),
     ('transport',    'Transport Manager', 'trans123', ''),
     ('housekeeping', 'Housekeeping Lead', 'house123', ''),
-    ('maintenance',  'Maintenance Lead',  'maint123', '');
+    ('maintenance',  'Maintenance Lead',  'maint123', ''),
+    ('librarian',    'Librarian',         'lib123',   '');
 `);
 
 // ══════════════════════════════════════════════════════════════
@@ -534,6 +579,8 @@ app.get('/api/stats', (req, res) => {
     pending_trips:         (isAdmin||role==='transport') ? db.prepare(`SELECT COUNT(*) c FROM trips WHERE status='pending'`).get().c : 0,
     pending_maintenance:   (isAdmin||role==='maintenance') ? db.prepare(`SELECT COUNT(*) c FROM maintenance_jobs WHERE status='pending'`).get().c : 0,
     pending_housekeeping:  (isAdmin||role==='housekeeping') ? db.prepare(`SELECT COUNT(*) c FROM damage_reports WHERE status='forwarded'`).get().c : 0,
+    unreturned_books:      (isAdmin||role==='librarian') ? db.prepare(`SELECT COUNT(*) c FROM book_borrowing WHERE status='borrowed'`).get().c : 0,
+    pending_book_requisitions: (isAdmin||role==='librarian') ? db.prepare(`SELECT COUNT(*) c FROM requisitions WHERE status='pending' AND from_role='librarian'`).get().c : 0,
     low_stock_alerts:      0,
     announcements:         db.prepare(`SELECT * FROM announcements WHERE to_roles='all' OR to_roles LIKE ? ORDER BY created_at DESC LIMIT 5`).all(`%${role}%`),
     recent_activity:       db.prepare(`SELECT * FROM activity_log WHERE role=? OR role='admin' ORDER BY created_at DESC LIMIT 10`).all(role),
@@ -926,6 +973,67 @@ app.delete('/api/announcements/:id', (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════════
+//  LIBRARY
+// ══════════════════════════════════════════════════════════════
+app.get('/api/books', (req, res) => res.json(db.prepare('SELECT * FROM library_books ORDER BY created_at DESC').all()));
+app.post('/api/books', (req, res) => {
+  const f = req.body;
+  if (!f.code || !f.title) return res.status(400).json({ error: 'Code and title required.' });
+  const ref = `BK-${Date.now()}`;
+  db.prepare('INSERT INTO library_books (code,title,author,quantity,location,unit_cost,supplier,received_date,notes) VALUES (?,?,?,?,?,?,?,?,?)').run(f.code,f.title,f.author||'',f.quantity||0,f.location||'',f.unit_cost||0,f.supplier||'',f.received_date||'',f.notes||'');
+  const rec = db.prepare('SELECT * FROM library_books WHERE code=?').get(f.code);
+  logActivity('librarian','book_added',`${f.title} (Code: ${f.code})`);
+  sendTo('all','book_added',rec);
+  res.json({ success:true, book:rec });
+});
+app.patch('/api/books/:id', (req, res) => {
+  const f = req.body;
+  db.prepare('UPDATE library_books SET quantity=?,location=?,unit_cost=?,supplier=?,notes=? WHERE id=?').run(f.quantity||0,f.location||'',f.unit_cost||0,f.supplier||'',f.notes||'',req.params.id);
+  const rec = db.prepare('SELECT * FROM library_books WHERE id=?').get(req.params.id);
+  logActivity('librarian','book_updated',rec.title);
+  res.json({ success:true, book:rec });
+});
+
+app.get('/api/borrowing', (req, res) => {
+  const { status } = req.query;
+  let q = 'SELECT * FROM book_borrowing WHERE 1=1';
+  const p = [];
+  if (status) { q += ' AND status=?'; p.push(status); }
+  res.json(db.prepare(q + ' ORDER BY created_at DESC').all(...p));
+});
+app.post('/api/borrowing', (req, res) => {
+  const f = req.body;
+  if (!f.book_title || !f.student_admission || !f.student_class) return res.status(400).json({ error: 'Book, student admission, and class required.' });
+  const ref = `BR-${Date.now()}`;
+  const today = new Date().toISOString().split('T')[0];
+  db.prepare('INSERT INTO book_borrowing (ref,book_title,book_code,student_admission,student_class,status,date_borrowed,notes) VALUES (?,?,?,?,?,?,?,?)').run(ref,f.book_title,f.book_code||'',f.student_admission,f.student_class,'borrowed',today,f.notes||'');
+  const rec = db.prepare('SELECT * FROM book_borrowing WHERE ref=?').get(ref);
+  logActivity('librarian','book_borrowed',`${f.book_title} to ${f.student_admission}`);
+  sendTo('all','book_borrowed',rec);
+  res.json({ success:true, borrowing:rec });
+});
+app.patch('/api/borrowing/:id/approve-return', (req, res) => {
+  const today = new Date().toISOString().split('T')[0];
+  db.prepare('UPDATE book_borrowing SET status=?, date_returned=?, approver=?, updated_at=? WHERE id=?').run('returned',today,'librarian',today,req.params.id);
+  const rec = db.prepare('SELECT * FROM book_borrowing WHERE id=?').get(req.params.id);
+  logActivity('librarian','book_return_approved',rec.book_title);
+  sendTo('all','book_returned',rec);
+  res.json({ success:true, borrowing:rec });
+});
+
+app.get('/api/exercise-exchanges', (req, res) => res.json(db.prepare('SELECT * FROM exercise_book_exchanges ORDER BY created_at DESC').all()));
+app.post('/api/exercise-exchanges', (req, res) => {
+  const f = req.body;
+  if (!f.student_name || !f.student_class || !f.book_type) return res.status(400).json({ error: 'Student name, class, and book type required.' });
+  const ref = `EX-${Date.now()}`;
+  db.prepare('INSERT INTO exercise_book_exchanges (ref,student_name,student_class,book_type,quantity,notes) VALUES (?,?,?,?,?,?)').run(ref,f.student_name,f.student_class,f.book_type,f.quantity||1,f.notes||'');
+  const rec = db.prepare('SELECT * FROM exercise_book_exchanges WHERE ref=?').get(ref);
+  logActivity('librarian','exercise_exchange',`${f.student_name} (${f.book_type})`);
+  sendTo('all','exercise_exchanged',rec);
+  res.json({ success:true, exchange:rec });
+});
+
+// ══════════════════════════════════════════════════════════════
 //  ACTIVITY LOG
 // ══════════════════════════════════════════════════════════════
 app.get('/api/activity', (req, res) => {
@@ -948,5 +1056,6 @@ server.listen(PORT, () => {
   console.log('Default passwords:');
   console.log('  admin → admin123  |  catering → cater123');
   console.log('  farm → farm123    |  transport → trans123');
-  console.log('  housekeeping → house123  |  maintenance → maint123\n');
+  console.log('  housekeeping → house123  |  maintenance → maint123');
+  console.log('  librarian → lib123\n');
 });
